@@ -2822,3 +2822,51 @@ fn binary_refuses_a_config_file_and_a_data_dir_together() {
         "{stderr}"
     );
 }
+
+/// A launcher's crash closes the pipe it held, and the server it started must
+/// not outlive it on the launcher's fixed port. Checked while Setup serves,
+/// because that is before any config exists and the first thing a new install
+/// runs.
+#[test]
+fn a_server_told_to_follow_its_stdin_exits_when_it_closes() {
+    let home = exe_temp_path("stdin-exe");
+    let data = temp_path("stdin-data");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let exe = binary_beside(&home);
+    let data_arg = data.to_str().unwrap().to_string();
+
+    let (_addr, mut server) = spawn_server(|addr| {
+        let mut command = Command::new(&exe);
+        scrubbed(&mut command)
+            .args(["web", "--web-addr", addr, "--data-dir", &data_arg])
+            .current_dir(&home)
+            .env("CODETRIAL_EXIT_WITH_STDIN", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    });
+
+    // All three ends, as a parent's death closes them. With stdout and stderr
+    // still read here, a server that wrote to a dead pipe on its way out would
+    // pass this and then outlive a real parent.
+    drop(server.stdout.take());
+    drop(server.stderr.take());
+    drop(server.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = server.try_wait().expect("child status should read") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&data);
+
+    let status = status.expect("the server should exit once its stdin closes");
+    assert!(status.success(), "{status}");
+}

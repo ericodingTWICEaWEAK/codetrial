@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -334,6 +335,7 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     // Why that socket is carried here rather than rebound: `serve_setup`. Read
     // once, so the question and the page it opens answer from the same map.
     let before_config = environment_and_flags(&options);
+    exit_when_stdin_closes();
     data_dir_config_from_environment(&options, is_production(&before_config))?;
     let handed_over = if is_cold_start(&options, &before_config) {
         Some(serve_setup(&before_config, &options)?)
@@ -696,6 +698,34 @@ fn web_error_log_path(options: &CliOptions) -> std::path::PathBuf {
         Some(dir) => dir.join("codetrial-error.log"),
         None => codetrial::exe_dir().join("codetrial-error.log"),
     }
+}
+
+/// Exits once standard input reaches end of file, when the process environment
+/// sets `CODETRIAL_EXIT_WITH_STDIN`.
+///
+/// For a launcher that runs this as its child. A pipe is closed by the kernel
+/// when its writer dies however it dies, so this is the one way a child learns
+/// its parent is gone on every platform alike: a crashed desktop app otherwise
+/// leaves this server holding its fixed port, and the next launch fails to
+/// bind it. From the process environment even for a `--data-dir` launch, which
+/// reads no configuration there, because this is not configuration: it is the
+/// launcher describing the pipe it handed over, and it has to hold while Setup
+/// serves, before any config file exists.
+fn exit_when_stdin_closes() {
+    if !codetrial::config::exit_with_stdin(
+        std::env::var("CODETRIAL_EXIT_WITH_STDIN").ok().as_deref(),
+    ) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+
+        // Not `eprintln!`, which panics when stderr is a pipe nobody reads any
+        // more: when the parent died, it held the other end of that one too,
+        // and the panic would end this thread instead of the process.
+        let _ = writeln!(std::io::stderr(), "standard input closed: exiting");
+        std::process::exit(0);
+    });
 }
 
 fn run_livekit(config: AgentConfig, room_name: &str) -> Result<(), String> {

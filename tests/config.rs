@@ -232,6 +232,19 @@ fn config_uses_defaults_for_blank_optional_web_runtime_fields() {
     );
 }
 
+/// Off unless asked for: a server whose stdin is `/dev/null`, which is every
+/// service manager's default, would otherwise exit the moment it started.
+#[test]
+fn exiting_with_stdin_is_only_on_when_a_launcher_asks() {
+    let exits = codetrial::config::exit_with_stdin;
+    for off in [None, Some(""), Some("0"), Some("false"), Some("maybe")] {
+        assert!(!exits(off), "{off:?} should leave it off");
+    }
+    for on in ["1", "true", "yes"] {
+        assert!(exits(Some(on)), "{on} should turn it on");
+    }
+}
+
 /// Asserted on the parser rather than through a config struct, because the
 /// struct field it used to be read through was only ever consumed by `serve`.
 ///
