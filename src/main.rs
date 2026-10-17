@@ -26,6 +26,7 @@ struct CliOptions {
     config_path: Option<String>,
     web_addr: Option<String>,
     web_dir: Option<String>,
+    allowed_hosts: Option<String>,
     room_prefix: Option<String>,
     duration_min: Option<u32>,
 }
@@ -200,6 +201,7 @@ fn parse_agent_args(args: &[String]) -> Result<(Vec<String>, CliOptions), String
         match flag {
             "--config" => options.config_path = Some(value),
             "--web-addr" => options.web_addr = Some(value),
+            "--allowed-hosts" => options.allowed_hosts = Some(value),
             "--web-dir" => options.web_dir = Some(value),
             "--room-prefix" => options.room_prefix = Some(value),
             "--duration-min" => {
@@ -235,7 +237,7 @@ fn print_help(usage: Option<&str>) {
         }
     }
     println!(
-        "\nOptions:\n  --config PATH        Use PATH instead of config/codetrial.env.local\n  --web-addr ADDR      Listen on ADDR\n  --web-dir PATH       Serve files from PATH\n  --room-prefix PREFIX Prefix generated room names\n  --duration-min MIN   Set the interview duration\n  -h, --help           Show this help\n  -V, --version        Show the package version and build commit\n\nEvery option also takes `--flag=value`, which is the only way to pass a value\nthat starts with a dash. `--` ends the options."
+        "\nOptions:\n  --config PATH        Use PATH instead of config/codetrial.env.local\n  --web-addr ADDR      Listen on ADDR\n  --allowed-hosts LIST Answer only these comma-separated Host values\n  --web-dir PATH       Serve files from PATH\n  --room-prefix PREFIX Prefix generated room names\n  --duration-min MIN   Set the interview duration\n  -h, --help           Show this help\n  -V, --version        Show the package version and build commit\n\nEvery option also takes `--flag=value`, which is the only way to pass a value\nthat starts with a dash. `--` ends the options."
     );
 }
 
@@ -290,6 +292,7 @@ fn web_server_config(
         fixed_room_name: nonempty(values, "INTERVIEW_ROOM_NAME"),
         production,
         trusted_proxy_hops: trusted_proxy_hops(values),
+        allowed_hosts: allowed_hosts(values),
         compiler_explorer_enabled: compiler_explorer_enabled(values),
         recording,
         pool,
@@ -774,6 +777,9 @@ fn apply_options(values: &mut BTreeMap<String, String>, options: &CliOptions) {
     if let Some(value) = &options.web_dir {
         values.insert("CODETRIAL_WEB_DIR".to_string(), value.clone());
     }
+    if let Some(value) = &options.allowed_hosts {
+        values.insert("CODETRIAL_ALLOWED_HOSTS".to_string(), value.clone());
+    }
     if let Some(value) = &options.room_prefix {
         values.insert("CODETRIAL_ROOM_PREFIX".to_string(), value.clone());
     }
@@ -989,6 +995,16 @@ fn interview_duration_min(values: &BTreeMap<String, String>) -> u32 {
     nonempty(values, "CODETRIAL_DURATION_MIN")
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_DURATION_MIN)
+}
+
+/// `CODETRIAL_ALLOWED_HOSTS`, a comma-separated list of `Host` values.
+fn allowed_hosts(values: &BTreeMap<String, String>) -> Vec<String> {
+    value_or(values, "CODETRIAL_ALLOWED_HOSTS", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn trusted_proxy_hops(values: &BTreeMap<String, String>) -> u32 {

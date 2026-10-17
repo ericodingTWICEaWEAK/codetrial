@@ -286,6 +286,7 @@ The common ones:
 | `CODETRIAL_GEMINI_CANDIDATE_VIDEO_ENABLED` | `false` | Forward candidate video to Gemini, one low-resolution frame in five seconds; ignored in a whiteboard interview |
 | `CODETRIAL_COMPILER_EXPLORER_ENABLED` | `true` | Enable remote C, C++, and Java runs |
 | `CODETRIAL_MAX_CONCURRENT_INTERVIEWS` | `16` | Interviews one `web` process hosts agents for |
+| `CODETRIAL_ALLOWED_HOSTS` | empty | Comma-separated `Host` values the server answers; any other is refused with 421. Empty answers every name. `--allowed-hosts` sets it from the command line |
 
 Two more matter in production. `SESSION_SECRET` signs the session cookie, and
 its built-in default is a string published in this repository, so the server

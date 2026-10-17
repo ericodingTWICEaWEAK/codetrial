@@ -74,6 +74,17 @@ pub struct WebServerConfig {
     /// client from `X-Forwarded-For`, which is only safe once every request is
     /// known to pass through that many proxies you control.
     pub trusted_proxy_hops: u32,
+    /// The `Host` values this server answers, compared whole and without case,
+    /// or empty to answer any. `CODETRIAL_ALLOWED_HOSTS` sets it.
+    ///
+    /// A loopback bind keeps the network out, but not a page on another origin:
+    /// that page can give its own name a short TTL, repoint it at 127.0.0.1
+    /// and then read this server as same origin. The desktop app sets this so
+    /// such a page is refused, because it keeps a server on a fixed port for as
+    /// long as it is open and its reports sit behind that port. Empty by
+    /// default, because a reverse proxy that forwards the public name is an
+    /// ordinary deployment and would otherwise be refused.
+    pub allowed_hosts: Vec<String>,
     /// Production recording, or `None` when it is off, which is every
     /// deployment that has not provisioned the resources in
     /// `docs/recording-contract.md`.
@@ -127,6 +138,7 @@ impl fmt::Debug for WebServerConfig {
             production,
             compiler_explorer_enabled,
             trusted_proxy_hops,
+            allowed_hosts,
             recording,
             pool,
             probe_provider_quota,
@@ -151,6 +163,7 @@ impl fmt::Debug for WebServerConfig {
             .field("production", production)
             .field("compiler_explorer_enabled", compiler_explorer_enabled)
             .field("trusted_proxy_hops", trusted_proxy_hops)
+            .field("allowed_hosts", allowed_hosts)
             .field("recording", recording)
             .field("pool", pool)
             .field("probe_provider_quota", probe_provider_quota)
@@ -420,7 +433,7 @@ pub(crate) fn web_router(
         provider_quota.clone(),
         config.pool.clone(),
     ));
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/api/token", post(token_handler))
         .route("/api/observer-token", post(observer_token_handler))
@@ -466,7 +479,20 @@ pub(crate) fn web_router(
         .layer(axum::middleware::from_fn_with_state(
             security_header_state(&config),
             security_headers,
+        ));
+
+    // Only when there is a list, so a deployment that names no host pays
+    // nothing per request for a check that would pass everything.
+    let router = if config.allowed_hosts.is_empty() {
+        router
+    } else {
+        router.layer(axum::middleware::from_fn_with_state(
+            Arc::new(config.allowed_hosts.clone()),
+            allowed_host,
         ))
+    };
+
+    router
         // Outermost, so it sees the finished response whatever produced it.
         // `web/` is 13 MB, over 11 MB of that wasm, and shipping it verbatim is
         // the one cost a candidate pays before the timer is useful to them.
@@ -495,6 +521,30 @@ pub(crate) fn web_router(
             background: Arc::new(background),
             room_authorizations: Arc::default(),
         })
+}
+
+/// Refuses a request whose `Host` is not on [`WebServerConfig::allowed_hosts`],
+/// before any route sees it, `/healthz` included.
+///
+/// 421 rather than 403: the request is not forbidden to its sender, it reached
+/// a server that does not answer to the name it used.
+async fn allowed_host(
+    axum::extract::State(allowed): axum::extract::State<Arc<Vec<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if host_is_allowed(&allowed, request.headers().get(header::HOST)) {
+        return next.run(request).await;
+    }
+    json_response(
+        StatusCode::MISDIRECTED_REQUEST,
+        json!({ "error": "This server does not answer to that host name." }),
+    )
+}
+
+fn host_is_allowed(allowed: &[String], host: Option<&axum::http::HeaderValue>) -> bool {
+    host.and_then(|value| value.to_str().ok())
+        .is_some_and(|host| allowed.iter().any(|name| name.eq_ignore_ascii_case(host)))
 }
 
 impl AppState {
