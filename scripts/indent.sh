@@ -44,6 +44,10 @@ list()
 }
 
 rust=$(list 'build.rs' 'src/*.rs' 'tests/*.rs')
+
+# The desktop app is a crate of its own, so `cargo fmt` at the root never sees
+# it and it needs its manifest named.
+desktop=$(list 'desktop/build.rs' 'desktop/src/*.rs' 'desktop/tests/*.rs')
 shell=$(list '*.sh')
 
 # tests/ as well as scripts/: the Python under tests/ drives the recording and
@@ -74,12 +78,15 @@ have()
 # must not skip.
 format()
 {
-    if [ -n "$rust$shell" ] && have commentflow; then
+    if [ -n "$rust$desktop$shell" ] && have commentflow; then
         # shellcheck disable=SC2086
-        commentflow $rust $shell || return 1
+        commentflow $rust $desktop $shell || return 1
     fi
     if [ -n "$rust" ] && have cargo; then
         cargo fmt || return 1
+    fi
+    if [ -n "$desktop" ] && have cargo; then
+        cargo fmt --manifest-path desktop/Cargo.toml || return 1
     fi
     if [ -n "$python" ] && have ruff; then
         # shellcheck disable=SC2086
@@ -119,11 +126,14 @@ fi
 work=$(mktemp -d) || exit 2
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
-files=$(printf '%s\n%s\n%s\n' "$rust" "$shell" "$python" | grep -v '^$')
+files=$(printf '%s\n%s\n%s\n%s\n' "$rust" "$desktop" "$shell" "$python" | grep -v '^$')
+manifests=Cargo.toml
+[ -z "$desktop" ] || manifests="$manifests desktop/Cargo.toml"
 
 # One tar pipe rather than a mkdir and a cp per file: 81 files was 162 process
 # spawns and most of this gate's wall clock.
-printf '%s\n' "$files" Cargo.toml .editorconfig \
+# shellcheck disable=SC2086
+printf '%s\n' "$files" $manifests .editorconfig \
     | tar -cf - -T - \
     | (cd "$work" && tar -xf -) || exit 2
 

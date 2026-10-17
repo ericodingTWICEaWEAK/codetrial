@@ -154,13 +154,40 @@ jobs:
             "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
           df -h /
 
+      # Whether this run builds the desktop app. It shares no code with the
+      # server, only the launch contract in src/main.rs (the flags it passes
+      # and the line it waits for, which its tests read), so a pull request
+      # that leaves those, the gate script and this file alone cannot change
+      # its result, and skips the WebKitGTK install and the build below; the
+      # gate then reports the lane as not checked. A push to main always
+      # builds it.
+      - name: Decide whether to build the desktop app
+        id: desktop
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] \
+            || ! git diff --quiet "$BASE_SHA" HEAD -- desktop src/main.rs scripts/test.sh .github/workflows/check.yml; then
+            echo "build=true" >>"$GITHUB_OUTPUT"
+          fi
+
       # shellcheck and shfmt ride along on an apt call this job already makes.
       # The runner image ships shellcheck today, but both gates skip themselves
       # when the tool is absent, and a gate that stops running quietly is the
       # thing it guards against. shfmt takes its style from .editorconfig, so
       # installing it here is the whole configuration.
+      #
+      # WebKitGTK and the three after it are what desktop/ links against; the
+      # `desktop` gate skips without them for the same reason.
       - name: Install native build dependency
-        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev mold shellcheck shfmt
+        env:
+          DESKTOP_PACKAGES: >-
+            ${{ steps.desktop.outputs.build == 'true'
+                && 'libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          sudo apt-get update && sudo apt-get install -y libglib2.0-dev mold shellcheck shfmt \
+            $DESKTOP_PACKAGES
       - name: Install WebRTC C++ compiler
         uses: ./.github/actions/webrtc-clang
 
@@ -208,8 +235,21 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
+            !target/desktop
           key: cargo-${{ runner.os }}-${{ steps.rust.outputs.id }}-${{ hashFiles('Cargo.lock', '.github/workflows/check.yml') }}
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust.outputs.id }}-
+
+      # The desktop crate's build, in an entry of its own. The one above is also
+      # what every mutation shard restores, and a path added to it would be a
+      # gigabyte of WebKit bindings each shard downloads and never reads.
+      - name: Restore desktop cargo cache
+        id: desktop-cache
+        if: steps.desktop.outputs.build == 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: target/desktop
+          key: desktop-${{ runner.os }}-${{ steps.rust.outputs.id }}-${{ hashFiles('desktop/Cargo.lock', '.github/workflows/check.yml') }}
+          restore-keys: desktop-${{ runner.os }}-${{ steps.rust.outputs.id }}-
 
       # Keyed on the whole tree, not on SHA256SUMS alone. The cached path holds
       # the committed vendor files as well as the fetched ones, so a key that
@@ -360,7 +400,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
+            !target/desktop
           key: cargo-${{ runner.os }}-${{ steps.rust.outputs.id }}-${{ hashFiles('Cargo.lock', '.github/workflows/check.yml') }}
+
+      - name: Save desktop cargo cache
+        if: >-
+          ${{ !cancelled() && steps.desktop.outputs.build == 'true'
+              && steps.desktop-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: target/desktop
+          key: desktop-${{ runner.os }}-${{ steps.rust.outputs.id }}-${{ hashFiles('desktop/Cargo.lock', '.github/workflows/check.yml') }}
 
   # How many shards the diff is worth, decided before any of them start.
   #
@@ -527,6 +577,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
+            !target/desktop
           key: cargo-${{ runner.os }}-${{ steps.rust.outputs.id }}-${{ hashFiles('Cargo.lock', '.github/workflows/check.yml') }}
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust.outputs.id }}-
 

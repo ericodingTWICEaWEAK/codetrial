@@ -192,7 +192,28 @@ cargo_audit_gate()
         return 0
     fi
 
-    cargo audit --file "$ROOT/Cargo.lock"
+    cargo audit --file "$ROOT/Cargo.lock" \
+        && cargo audit --file "$ROOT/desktop/Cargo.lock"
+}
+
+# The desktop app is a crate of its own with its own lockfile, so none of the
+# root's fmt, clippy or test gates reach it. Building it needs the platform's
+# webview, which on Linux is WebKitGTK's development package: a machine without
+# one skips the build and says so, the way a missing linter does. CI installs it
+# whenever a pull request touches desktop/, which is the only way to change this
+# lane's result.
+desktop_gate()
+{
+    manifest=$ROOT/desktop/Cargo.toml
+    if [ "$(uname -s)" = Linux ] \
+        && ! pkg-config --exists webkit2gtk-4.1 > /dev/null 2>&1; then
+        skip "desktop clippy and tests: libwebkit2gtk-4.1-dev builds desktop/"
+        return 0
+    fi
+    target=$ROOT/target/desktop
+    cargo clippy --locked --all-targets --manifest-path "$manifest" \
+        --target-dir "$target" -- -D warnings \
+        && cargo test --locked --manifest-path "$manifest" --target-dir "$target"
 }
 
 # The Python here is not incidental: it generates the problem bank, checks the
@@ -295,6 +316,8 @@ fi
 gate clippy cargo clippy --locked --all-targets --manifest-path "$ROOT/Cargo.toml" -- -D warnings
 gate release-msrv release_msrv_matches
 gate cargo-test cargo test --locked --manifest-path "$ROOT/Cargo.toml"
+gate desktop-fmt cargo fmt --check --manifest-path "$ROOT/desktop/Cargo.toml"
+gate desktop desktop_gate
 
 gate gen-problems "$PYTHON" "$ROOT/scripts/gen-problems.py" --check
 
