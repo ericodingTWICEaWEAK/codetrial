@@ -149,8 +149,8 @@ needed, and C, C++ and Java runs still go to Compiler Explorer.
 
 ## What has not been qualified
 
-The unit tests in the gate prove the app starts and stops a server, and keeps
-its window to its own origins.
+The checks in the gate and the smoke test below prove the app starts its
+server, serves only to its own origin, and does not leave the server behind.
 They do not prove an interview works in a given web view. Before a release is
 called more than a preview, each platform needs these run on real hardware,
 with the outcome recorded per case:
@@ -223,3 +223,14 @@ so the `.deb` and `.rpm` also put the CLI on the `PATH`.
 platform's web view can be linked, which on Linux means `libwebkit2gtk-4.1-dev`
 is installed. Without it the gate skips and says so. The formatter chain and
 `cargo audit` cover `desktop/` as well.
+
+`scripts/desktop-smoke.sh APP` is outside the gate because it needs a built app
+and a display. It starts the app, checks that its server answers with the Setup
+page and refuses a foreign `Host`, then kills the app with SIGKILL and checks
+the server went with it. On Linux, run it under `xvfb-run -a`.
+
+`.github/workflows/desktop.yml` builds the installers on all three platforms
+and runs the smoke test against each build, for pull requests that touch the
+app and for pushes to `main` that do. A tag `desktop-vX.Y.Z` additionally
+publishes them as a prerelease, after checking that `X.Y.Z` is the version in
+`desktop/Cargo.toml`. The CLI's rolling `latest` release is not touched.
