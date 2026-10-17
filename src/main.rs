@@ -20,10 +20,14 @@ const CONFIG_FILE_NAME: &str = "codetrial.env.local";
 const CONFIG_EXAMPLE_NAME: &str = "codetrial.env.example";
 const DEFAULT_ACCOUNT_DB_PATH: &str = "codetrial.db";
 const DEFAULT_SESSION_SECRET: &str = "codetrial-local-session";
+/// Where a `--data-dir` install keeps the key its session cookies are signed
+/// with, when its config file does not set `SESSION_SECRET`.
+const SESSION_SECRET_FILE: &str = "session-secret";
 
 #[derive(Debug, Default, Clone)]
 struct CliOptions {
     config_path: Option<String>,
+    data_dir: Option<PathBuf>,
     web_addr: Option<String>,
     web_dir: Option<String>,
     allowed_hosts: Option<String>,
@@ -40,8 +44,9 @@ struct CliOptions {
 const MODES: [(&str, usize, &str, ModeFn); 3] = [
     ("web", 1, "codetrial web [OPTIONS]", |_, options| {
         // Logged for `web` only: `run-livekit`/`check-gemini` are terminal-run
-        // tooling.
-        run_web(options).inspect_err(|error| log_web_error(error))
+        // tooling. The path is taken before `run_web` owns the options.
+        let log = web_error_log_path(&options);
+        run_web(options).inspect_err(|error| log_web_error(&log, error))
     }),
     (
         "run-livekit",
@@ -200,6 +205,7 @@ fn parse_agent_args(args: &[String]) -> Result<(Vec<String>, CliOptions), String
         };
         match flag {
             "--config" => options.config_path = Some(value),
+            "--data-dir" => options.data_dir = Some(PathBuf::from(value)),
             "--web-addr" => options.web_addr = Some(value),
             "--allowed-hosts" => options.allowed_hosts = Some(value),
             "--web-dir" => options.web_dir = Some(value),
@@ -215,6 +221,18 @@ fn parse_agent_args(args: &[String]) -> Result<(Vec<String>, CliOptions), String
             }
             _ => return Err(format!("unknown flag: {flag}")),
         }
+    }
+
+    // Two answers to where the config file is. `--data-dir` exists so that a
+    // launcher can say everything lives in one folder, and a `--config` beside
+    // it would put the file somewhere else while the database and the log
+    // stayed behind.
+    if options.config_path.is_some() && options.data_dir.is_some() {
+        return Err(
+            "--config and --data-dir cannot be combined: --data-dir already names the \
+             folder the config file is read from"
+                .to_string(),
+        );
     }
     Ok((positionals, options))
 }
@@ -237,7 +255,7 @@ fn print_help(usage: Option<&str>) {
         }
     }
     println!(
-        "\nOptions:\n  --config PATH        Use PATH instead of config/codetrial.env.local\n  --web-addr ADDR      Listen on ADDR\n  --allowed-hosts LIST Answer only these comma-separated Host values\n  --web-dir PATH       Serve files from PATH\n  --room-prefix PREFIX Prefix generated room names\n  --duration-min MIN   Set the interview duration\n  -h, --help           Show this help\n  -V, --version        Show the package version and build commit\n\nEvery option also takes `--flag=value`, which is the only way to pass a value\nthat starts with a dash. `--` ends the options."
+        "\nOptions:\n  --config PATH        Use PATH instead of config/codetrial.env.local\n  --data-dir DIR       Keep the config, accounts and error log in DIR only\n  --web-addr ADDR      Listen on ADDR\n  --allowed-hosts LIST Answer only these comma-separated Host values\n  --web-dir PATH       Serve files from PATH\n  --room-prefix PREFIX Prefix generated room names\n  --duration-min MIN   Set the interview duration\n  -h, --help           Show this help\n  -V, --version        Show the package version and build commit\n\nEvery option also takes `--flag=value`, which is the only way to pass a value\nthat starts with a dash. `--` ends the options."
     );
 }
 
@@ -281,7 +299,17 @@ fn web_server_config(
     recording_can_deliver(recording.as_ref())?;
 
     Ok(WebServerConfig {
-        web_dir: PathBuf::from(value_or(values, "CODETRIAL_WEB_DIR", DEFAULT_WEB_DIR)),
+        web_dir: match nonempty(values, "CODETRIAL_WEB_DIR") {
+            Some(dir) => PathBuf::from(dir),
+
+            // Under the data directory rather than the working one, which a
+            // launcher does not choose: a `web/` that happens to sit where the
+            // app was started would otherwise replace the embedded pages.
+            None => match &options.data_dir {
+                Some(dir) => dir.join(DEFAULT_WEB_DIR),
+                None => PathBuf::from(DEFAULT_WEB_DIR),
+            },
+        },
         github_client_id: nonempty(values, "GITHUB_CLIENT_ID"),
         github_client_secret: nonempty(values, "GITHUB_CLIENT_SECRET"),
         session_secret: Some(value_or(values, "SESSION_SECRET", DEFAULT_SESSION_SECRET)),
@@ -306,8 +334,9 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     // Why that socket is carried here rather than rebound: `serve_setup`. Read
     // once, so the question and the page it opens answer from the same map.
     let before_config = environment_and_flags(&options);
+    data_dir_config_from_environment(&options, is_production(&before_config))?;
     let handed_over = if is_cold_start(&options, &before_config) {
-        Some(serve_setup(&before_config)?)
+        Some(serve_setup(&before_config, &options)?)
     } else {
         None
     };
@@ -371,7 +400,7 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     // next thing to go wrong sends them back to a message from days ago. This
     // is the only moment that can tell those apart, and the error text points
     // at nothing else.
-    clear_web_error_log();
+    clear_web_error_log(&options);
 
     // Whether this process also hosts interviewers. A full agent config, which
     // is a Gemini key on top of what the web side needs, means yes; without it
@@ -512,7 +541,10 @@ fn environment_supplies_credentials(values: &BTreeMap<String, String>) -> bool {
 /// connections this page just served, and `TIME_WAIT` outlasts any retry worth
 /// writing. The loser has already written the config, so it has also spent the
 /// cold start that would have brought Setup back.
-fn serve_setup(values: &BTreeMap<String, String>) -> Result<std::net::TcpListener, String> {
+fn serve_setup(
+    values: &BTreeMap<String, String>,
+    options: &CliOptions,
+) -> Result<std::net::TcpListener, String> {
     let listener = bind_web_listener(&value_or(values, "CODETRIAL_WEB_ADDR", DEFAULT_WEB_ADDR))?;
 
     // Fails closed on an address the socket cannot name, for the reason
@@ -556,7 +588,7 @@ fn serve_setup(values: &BTreeMap<String, String>) -> Result<std::net::TcpListene
                 ready.clone(),
                 is_production(values),
                 bound.port(),
-                cold_start_config_path(),
+                cold_start_config_path(options),
             );
             axum::serve(listener, service)
                 .with_graceful_shutdown(async move { ready.notified().await })
@@ -640,23 +672,30 @@ fn public_setup_refusal(
 /// Headed by the same build line the console shows first. This file is what
 /// arrives when that owner reports the failure, and a report that cannot name
 /// its build cannot say whether a fix is already in it.
-fn log_web_error(error: &str) {
-    let _ = std::fs::write(
-        web_error_log_path(),
-        format!("{}\n{error}\n", build_version()),
-    );
+fn log_web_error(path: &std::path::Path, error: &str) {
+    // A `--data-dir` that does not exist yet is the usual first failure, and
+    // the folder it names is where its owner will look for the reason.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{}\n{error}\n", build_version()));
 }
 
 /// Dropped once a launch is past everything that could have written one, so
 /// the file's presence means the last `web` start failed rather than that one
 /// ever did. Best-effort, like the write: a log that cannot be removed must
 /// not stop a server that is otherwise ready.
-fn clear_web_error_log() {
-    let _ = std::fs::remove_file(web_error_log_path());
+fn clear_web_error_log(options: &CliOptions) {
+    let _ = std::fs::remove_file(web_error_log_path(options));
 }
 
-fn web_error_log_path() -> std::path::PathBuf {
-    codetrial::exe_dir().join("codetrial-error.log")
+/// In the data directory when there is one: an installed app's executable
+/// folder is read-only, or inside an application bundle nobody opens.
+fn web_error_log_path(options: &CliOptions) -> std::path::PathBuf {
+    match &options.data_dir {
+        Some(dir) => dir.join("codetrial-error.log"),
+        None => codetrial::exe_dir().join("codetrial-error.log"),
+    }
 }
 
 fn run_livekit(config: AgentConfig, room_name: &str) -> Result<(), String> {
@@ -751,17 +790,110 @@ fn load_agent_config(options: &CliOptions) -> Result<AgentConfig, String> {
 /// `binary_web_reads_deployment_keys_from_the_config_file` refuses, because a
 /// key set in the config file was once silently a no-op.
 fn environment_and_flags(options: &CliOptions) -> BTreeMap<String, String> {
-    let mut values = std::env::vars().collect::<BTreeMap<_, _>>();
+    let mut values = environment(options);
     apply_options(&mut values, options);
     values
 }
 
+/// A first `--data-dir` launch started where the credentials Setup asks for
+/// are already exported writes them into the folder's config, as Setup would
+/// have, instead of asking for them again; every later launch then finds the
+/// file, including one started from a desktop that exports nothing.
+///
+/// The one exception to `environment` ignoring the process environment, and a
+/// narrow one: only Setup's own keys, only while the folder has no config, and
+/// written down rather than read live, so the file stays the whole of the
+/// install's configuration.
+fn data_dir_config_from_environment(options: &CliOptions, production: bool) -> Result<(), String> {
+    let Some(dir) = &options.data_dir else {
+        return Ok(());
+    };
+    let path = dir.join(CONFIG_FILE_NAME);
+    if path.exists() {
+        return Ok(());
+    }
+    let exported = std::env::vars().collect();
+    let Some(contents) =
+        codetrial::web::config_from_values(&exported, production).map_err(|error| {
+            format!("the exported Setup keys cannot be written to a config: {error}")
+        })?
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(dir)
+        .and_then(|()| codetrial::create_owner_only(&path, contents.as_bytes()))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    println!(
+        "codetrial: wrote {} from the exported LiveKit and Google keys",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The process environment, or nothing for a `--data-dir` launch.
+///
+/// A launcher that names the folder is saying the install's configuration is
+/// in it, and an environment it was started from is not part of that: a shell
+/// that exported `CODETRIAL_DB_PATH` or `NODE_ENV` for a CLI deployment would
+/// otherwise move this install's reports, or change its rules, depending on
+/// how it was started. Decided here, once, rather than by every launcher
+/// keeping its own list of the keys this program reads.
+fn environment(options: &CliOptions) -> BTreeMap<String, String> {
+    if options.data_dir.is_some() {
+        return BTreeMap::new();
+    }
+    std::env::vars().collect()
+}
+
 fn load_values(options: &CliOptions) -> Result<BTreeMap<String, String>, String> {
-    let mut values = std::env::vars().collect::<BTreeMap<_, _>>();
+    let mut values = environment(options);
     let path = primary_config_path(options)?;
     codetrial::config::apply_config_file(&mut values, codetrial::config::read_config_file(&path)?);
     apply_options(&mut values, options);
+    if let Some(dir) = &options.data_dir
+        && nonempty(&values, "SESSION_SECRET").is_none()
+    {
+        let secret = data_dir_session_secret(&dir.join(SESSION_SECRET_FILE))?;
+        values.insert("SESSION_SECRET".to_string(), secret);
+    }
     Ok(values)
+}
+
+/// The key a `--data-dir` install signs session cookies with, made on its first
+/// launch and reused, so a relaunch keeps everyone signed in.
+///
+/// Not the built-in default: that one is published, and any program on the
+/// machine can reach a loopback port to present a cookie signed with it.
+/// Owner-only on Unix for the same reason. A file that is not a key this wrote
+/// is refused rather than replaced, because replacing it signs everyone out
+/// and hides whatever damaged it.
+fn data_dir_session_secret(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let secret = text.trim();
+            if secret.len() >= 32
+                && secret
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            {
+                Ok(secret.to_string())
+            } else {
+                Err(format!(
+                    "{} is not a session key this program wrote. Move it aside to make a new \
+                     one; everyone will be signed out.",
+                    path.display()
+                ))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let secret = codetrial::accounts::random_token(32)
+                .map_err(|error| format!("cannot generate a session key: {error}"))?;
+            codetrial::create_owner_only(path, secret.as_bytes())
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            Ok(secret)
+        }
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    }
 }
 
 /// The flags, over whatever the environment and the config file said.
@@ -789,6 +921,20 @@ fn apply_options(values: &mut BTreeMap<String, String>, options: &CliOptions) {
 }
 
 fn primary_config_path(options: &CliOptions) -> Result<PathBuf, String> {
+    // The one place searched, and not one place among several: the working
+    // directory and the executable's folder are whatever the launcher left them
+    // as, so a config found there would belong to some other install.
+    if let Some(dir) = &options.data_dir {
+        let path = dir.join(CONFIG_FILE_NAME);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "required configuration file is missing: {}; write one with LIVEKIT_URL, \
+             LIVEKIT_API_KEY and LIVEKIT_API_SECRET",
+            path.display()
+        ));
+    }
     if let Some(path) = &options.config_path {
         let path = PathBuf::from(path);
         if !path.is_file() {
@@ -847,6 +993,10 @@ fn primary_config_path(options: &CliOptions) -> Result<PathBuf, String> {
 /// a `--config` pointing somewhere a process may not write is a startup
 /// failure that names the directory, and `CODETRIAL_DB_PATH` is the way out.
 fn config_dir(options: &CliOptions) -> PathBuf {
+    if let Some(dir) = &options.data_dir {
+        return dir.clone();
+    }
+
     // The search order comes from primary_config_path rather than being written
     // out again here. Spelled twice, it was free to drift, and the drift is
     // silent: the server keeps reading its own config while the pool quietly
@@ -1163,7 +1313,10 @@ fn account_db_path(values: &BTreeMap<String, String>, options: &CliOptions) -> P
 /// existing: a released binary run from a directory that happens to hold one
 /// would otherwise write the credentials there and lose them the moment it was
 /// next started from somewhere else.
-fn cold_start_config_path() -> PathBuf {
+fn cold_start_config_path(options: &CliOptions) -> PathBuf {
+    if let Some(dir) = &options.data_dir {
+        return dir.join(CONFIG_FILE_NAME);
+    }
     let in_checkout = PathBuf::from(CONFIG_DIR);
     if in_checkout.join(CONFIG_EXAMPLE_NAME).is_file() {
         return in_checkout.join(CONFIG_FILE_NAME);

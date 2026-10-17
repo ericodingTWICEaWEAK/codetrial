@@ -245,6 +245,45 @@ impl SetupFields {
         }
         pairs
     }
+
+    /// The file, from `pairs`, so it holds exactly the config that was checked.
+    /// Every value is known to carry no newline by now, which is what makes one
+    /// line per key a faithful encoding of it.
+    fn contents(&self) -> String {
+        self.pairs()
+            .iter()
+            .map(|(key, value)| format!("{key}={value}\n"))
+            .collect()
+    }
+}
+
+/// Why `value` cannot be written as a `KEY=value` line of the config file and
+/// read back as itself, if it cannot.
+///
+/// These are read back by `read_config_file`, which parses one line at a
+/// time: a newline inside a value is a second line, and a second line is a
+/// config key nobody submitted. `SESSION_SECRET` is one such key, and this
+/// process reads the file it just wrote.
+fn unwritable(key: &str, value: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return Some(format!("{key} must not contain control characters"));
+    }
+
+    // `read_config_file` does `trim_matches('"')` then `trim_matches('\'')`, so
+    // a value edged with either is probed as one string and loaded as another.
+    // Refused rather than written, for the reason the newline above is: this
+    // file format cannot carry the value, and answering 200 would mean the file
+    // does not hold what was checked. Refusing says so while there is still a
+    // form to say it in.
+    ['"', '\'']
+        .into_iter()
+        .find(|quote| value.starts_with(*quote) || value.ends_with(*quote))
+        .map(|edge| {
+            format!(
+                "{key} must not start or end with {edge}: the config file drops a quote at \
+                 either end, so the value read back would not be the one checked here"
+            )
+        })
 }
 
 /// Everything a submission can be refused for before anything is sent or
@@ -265,8 +304,7 @@ impl SetupFields {
 /// because `read_config_file` trims what it reads. And a `googleApiKey` of
 /// spaces is not empty to `is_empty`, so it takes the branch that probes Gemini
 /// and fails there for a field the form calls optional.
-#[allow(clippy::result_large_err)] // Responses are immediately returned by HTTP handlers.
-fn validated_fields(submission: &Value) -> Result<SetupFields, Response> {
+fn validated_fields(submission: &Value) -> Result<SetupFields, String> {
     let field = |key: &str| {
         submission
             .get(key)
@@ -285,52 +323,20 @@ fn validated_fields(submission: &Value) -> Result<SetupFields, Response> {
         // calls it missing, so accepting one here would write a file the launch
         // on the other side of this page refuses.
         if field(key).is_empty() {
-            return Err(super::json_response(
-                StatusCode::BAD_REQUEST,
-                json!({ "error": format!("{key} is required") }),
-            ));
+            return Err(format!("{key} is required"));
         }
     }
 
     // Every field, including the optional one, and before anything is sent
-    // anywhere. These are written as `KEY=value` lines below and read back by
-    // `read_config_file`, which parses one line at a time: a newline inside a
-    // value is a second line, and a second line is a config key nobody
-    // submitted. `SESSION_SECRET` is one such key, and this process reads the
-    // file it just wrote.
+    // anywhere.
     for key in [
         "livekitUrl",
         "livekitApiKey",
         "livekitApiSecret",
         "googleApiKey",
     ] {
-        if field(key).chars().any(char::is_control) {
-            return Err(super::json_response(
-                StatusCode::BAD_REQUEST,
-                json!({ "error": format!("{key} must not contain control characters") }),
-            ));
-        }
-
-        // `read_config_file` does `trim_matches('"')` then
-        // `trim_matches('\'')`, so a value edged with either is probed as one
-        // string and loaded as another. Refused rather than written, for the
-        // reason the newline above is: this file format cannot carry the value,
-        // and answering 200 would mean the file does not hold what was checked.
-        // Refusing says so while there is still a form to say it in.
-        if let Some(edge) = ['"', '\'']
-            .into_iter()
-            .find(|quote| field(key).starts_with(*quote) || field(key).ends_with(*quote))
-        {
-            return Err(super::json_response(
-                StatusCode::BAD_REQUEST,
-                json!({
-                    "error": format!(
-                        "{key} must not start or end with {edge}: the config file drops \
-                         a quote at either end, so the value read back would not be the \
-                         one checked here"
-                    )
-                }),
-            ));
+        if let Some(error) = unwritable(key, &field(key)) {
+            return Err(error);
         }
     }
 
@@ -340,6 +346,47 @@ fn validated_fields(submission: &Value) -> Result<SetupFields, Response> {
         livekit_api_secret: field("livekitApiSecret"),
         google_api_key: field("googleApiKey"),
     })
+}
+
+/// The config file Setup would write, from credentials that are already in
+/// `values` (a launch's environment), so a launch that has them is not asked
+/// for them again. `None` unless all three LiveKit keys are there, which leaves
+/// the asking to Setup.
+///
+/// The same checks as a submission, the format's and the URL's, but not the
+/// probes: those reach the network, and a value an operator exported is taken
+/// as a hand-written config file would be, and refused by the launch the same
+/// way if it is wrong.
+pub fn config_from_values(
+    values: &std::collections::BTreeMap<String, String>,
+    production: bool,
+) -> Result<Option<String>, String> {
+    let value = |key: &str| values.get(key).map_or("", |value| value.trim());
+    if ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"]
+        .iter()
+        .any(|key| value(key).is_empty())
+    {
+        return Ok(None);
+    }
+    let fields = validated_fields(&json!({
+        "livekitUrl": value("LIVEKIT_URL"),
+        "livekitApiKey": value("LIVEKIT_API_KEY"),
+        "livekitApiSecret": value("LIVEKIT_API_SECRET"),
+        "googleApiKey": value("GOOGLE_API_KEY"),
+    }))?;
+    crate::config::validate_livekit_url(&fields.livekit_url, production)?;
+
+    // Setup's form takes one Google key, but an operator may export the
+    // rotation list instead, and dropping it would leave the install web-only.
+    let mut contents = fields.contents();
+    let keys = value("GOOGLE_API_KEYS");
+    if !keys.is_empty() {
+        if let Some(error) = unwritable("GOOGLE_API_KEYS", keys) {
+            return Err(error);
+        }
+        contents.push_str(&format!("GOOGLE_API_KEYS={keys}\n"));
+    }
+    Ok(Some(contents))
 }
 
 /// Proves the credentials before a file is written from them.
@@ -435,9 +482,8 @@ async fn probe_credentials(fields: &SetupFields, production: bool) -> Option<Res
 /// file has to be found again on the next launch, from whatever directory that
 /// launch happens to start in.
 ///
-/// `Some` is the refusal. The mode and the `create_new` are the whole reason
-/// this is not two lines: the file holds `LIVEKIT_API_SECRET` and
-/// `GOOGLE_API_KEY`, and both defaults are wrong for it.
+/// `Some` is the refusal. The file holds `LIVEKIT_API_SECRET` and
+/// `GOOGLE_API_KEY`, hence `create_owner_only`.
 fn write_config_file(path: &Path, contents: &str) -> Option<Response> {
     // The directory is the caller's answer, and a released binary's copy of it
     // does not exist until the first submission.
@@ -450,25 +496,7 @@ fn write_config_file(path: &Path, contents: &str) -> Option<Response> {
         ));
     }
 
-    // `create_new`, so an existing name is reported rather than followed and
-    // truncated. `is_cold_start` reached this page by finding no config, and
-    // the `is_file` it asked answers no for a symlink with nothing at the end
-    // of it: without `O_EXCL` a dangling one planted here sends these
-    // credentials wherever it points.
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        // Otherwise the umask decides, and its usual answer is world-readable.
-        // This file holds `LIVEKIT_API_SECRET` and `GOOGLE_API_KEY`. Windows
-        // has no equivalent here and inherits the folder's ACL.
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let written = options
-        .open(path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()));
-    let Err(error) = written else {
+    let Err(error) = crate::create_owner_only(path, contents.as_bytes()) else {
         return None;
     };
     let reason = if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -494,23 +522,16 @@ async fn submit_setup(
 ) -> Response {
     let fields = match validated_fields(&submission) {
         Ok(fields) => fields,
-        Err(response) => return response,
+        Err(error) => {
+            return super::json_response(StatusCode::BAD_REQUEST, json!({ "error": error }));
+        }
     };
 
     if let Some(refusal) = probe_credentials(&fields, production).await {
         return refusal;
     }
 
-    // From `pairs`, so the file holds exactly the config that was checked and
-    // probed above. Every value is known to carry no newline by now, which is
-    // what makes one line per key a faithful encoding of it.
-    let contents = fields
-        .pairs()
-        .iter()
-        .map(|(key, value)| format!("{key}={value}\n"))
-        .collect::<String>();
-
-    if let Some(refusal) = write_config_file(&path, &contents) {
+    if let Some(refusal) = write_config_file(&path, &fields.contents()) {
         return refusal;
     }
 

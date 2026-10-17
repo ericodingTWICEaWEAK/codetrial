@@ -41,7 +41,7 @@ pub use auth::login_config;
 pub use interviews::REPLAY_RATE_LIMIT;
 use pool::{ProviderQuota, spawn_provider_quota_refresher};
 pub use recordings::READ_RATE_LIMIT;
-pub use setup::setup_service;
+pub use setup::{config_from_values, setup_service};
 pub use token::{TOKEN_RATE_LIMIT, TokenConfig, TokenResponse, token_response};
 
 pub const MAX_BODY_BYTES: usize = 8 * 1024;

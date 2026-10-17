@@ -176,3 +176,78 @@ impl Drop for AccountsScratch {
         std::fs::remove_dir_all(&self.dir).ok();
     }
 }
+
+fn values(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Exported credentials become the file a submission of them would have, so a
+/// launch that has them is not asked again; anything short of the LiveKit three
+/// is left for Setup to ask.
+#[test]
+fn exported_credentials_become_the_file_setup_would_write() {
+    let livekit = [
+        ("LIVEKIT_URL", " wss://example.livekit.cloud "),
+        ("LIVEKIT_API_KEY", "key"),
+        ("LIVEKIT_API_SECRET", "secret"),
+    ];
+    assert_eq!(
+        super::config_from_values(&values(&livekit), false)
+            .unwrap()
+            .unwrap(),
+        "LIVEKIT_URL=wss://example.livekit.cloud\nLIVEKIT_API_KEY=key\nLIVEKIT_API_SECRET=secret\n"
+    );
+
+    // The Google keys ride along when there are any, and nothing else does: the
+    // whole file is compared, so no other exported key can slip in.
+    let mut full = livekit.to_vec();
+    full.extend([
+        ("GOOGLE_API_KEY", "google"),
+        ("GOOGLE_API_KEYS", "one,two"),
+        ("NODE_ENV", "production"),
+        ("CODETRIAL_DB_PATH", "/elsewhere.db"),
+    ]);
+    assert_eq!(
+        super::config_from_values(&values(&full), false)
+            .unwrap()
+            .unwrap(),
+        "LIVEKIT_URL=wss://example.livekit.cloud\nLIVEKIT_API_KEY=key\nLIVEKIT_API_SECRET=secret\n\
+         GOOGLE_API_KEY=google\nGOOGLE_API_KEYS=one,two\n"
+    );
+
+    for missing in 0..livekit.len() {
+        let mut partial = livekit.to_vec();
+        partial[missing].1 = " ";
+        assert_eq!(
+            super::config_from_values(&values(&partial), false),
+            Ok(None)
+        );
+    }
+}
+
+/// Refused rather than written, for the reasons a submission is: the file
+/// cannot carry the value, or the launch reading it back would refuse the URL.
+#[test]
+fn exported_credentials_the_file_cannot_hold_are_refused() {
+    for (key, value) in [
+        ("LIVEKIT_API_SECRET", "secret\nSESSION_SECRET=chosen"),
+        ("LIVEKIT_API_KEY", "\"key\""),
+        ("LIVEKIT_URL", "ftp://example.livekit.cloud"),
+        ("GOOGLE_API_KEYS", "one\nSESSION_SECRET=chosen"),
+    ] {
+        let mut pairs = vec![
+            ("LIVEKIT_URL", "wss://example.livekit.cloud"),
+            ("LIVEKIT_API_KEY", "key"),
+            ("LIVEKIT_API_SECRET", "secret"),
+        ];
+        pairs.retain(|(name, _)| *name != key);
+        pairs.push((key, value));
+        assert!(
+            super::config_from_values(&values(&pairs), false).is_err(),
+            "{key}={value:?}"
+        );
+    }
+}

@@ -155,32 +155,47 @@ fn run_cli_until_exit_once(args: &[&str], envs: &[(&str, &str)]) -> Option<(i32,
 }
 
 /// One place builds the invocation, so the two runners cannot drift about which
-/// environment the child inherits. The removals matter: a developer with
-/// `NODE_ENV` or `SESSION_SECRET` exported would otherwise change what these
-/// tests are testing.
+/// environment the child inherits: none of this process's, see `scrubbed`.
 /// Runs a linked binary inside `cwd`, not the one in the target directory:
 /// the executable's own folder is a config search path and a place the Setup
 /// page writes, so a stray `codetrial.env.local` next to the real test binary
 /// would decide these tests.
 fn cli_command(args: &[&str], envs: &[(&str, &str)], cwd: &Path) -> Command {
     let mut command = Command::new(binary_beside(cwd));
-    command
+    scrubbed(&mut command)
         .args(args)
         .current_dir(cwd)
-        .env_remove("LIVEKIT_URL")
-        .env_remove("LIVEKIT_API_KEY")
-        .env_remove("LIVEKIT_API_SECRET")
-        .env_remove("GOOGLE_API_KEY")
-        .env_remove("CODETRIAL_ROOM_PREFIX")
-        .env_remove("CODETRIAL_DURATION_MIN")
-        .env_remove("CODETRIAL_WEB_DIR")
-        .env_remove("CODETRIAL_WEB_ADDR")
-        .env_remove("CODETRIAL_TRUSTED_PROXY_HOPS")
-        .env_remove("NODE_ENV")
-        .env_remove("SESSION_SECRET")
         .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command
+}
+
+/// A child with none of this process's environment except what starting a
+/// program needs. Clearing everything rather than listing what the server
+/// reads, because a list has to learn every key the server does, and a key it
+/// missed shows up only on the machine of a developer who exported it.
+///
+/// `LLVM_PROFILE_FILE` and `RUST_BACKTRACE` pass so a coverage run still sees
+/// the child and a panic in it still says where.
+fn scrubbed(command: &mut Command) -> &mut Command {
+    command.env_clear();
+    for key in [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "SystemRoot",
+        "windir",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "LLVM_PROFILE_FILE",
+        "RUST_BACKTRACE",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     command
 }
 
@@ -355,9 +370,9 @@ fn spawn_server(build: impl Fn(&str) -> Command) -> (String, ServerProcess) {
 /// A cold-start server: the binary beside `dir`, with no config file on any
 /// path it searches and no credentials in the environment.
 ///
-/// Three more variables are cleared than the credentials, because
-/// `serve_setup` reads all three: `CODETRIAL_WEB_ADDR` decides where it binds,
-/// `CODETRIAL_TRUSTED_PROXY_HOPS` can refuse the launch outright, and
+/// The whole environment is cleared, not only the credentials, and three of
+/// the keys `serve_setup` reads itself: `CODETRIAL_WEB_ADDR` decides where it
+/// binds, `CODETRIAL_TRUSTED_PROXY_HOPS` can refuse the launch outright, and
 /// `NODE_ENV` decides what a submission has to survive. A suite that inherits
 /// any of them from whoever ran it tests a different program on their machine
 /// than in CI -- and the failure arrives as `spawn_server` panicking on a
@@ -365,16 +380,9 @@ fn spawn_server(build: impl Fn(&str) -> Command) -> (String, ServerProcess) {
 fn spawn_cold_start(exe: &Path, dir: &Path, envs: &[(&str, String)]) -> (String, ServerProcess) {
     spawn_server(|addr| {
         let mut command = Command::new(exe);
-        command
+        scrubbed(&mut command)
             .args(["web", "--web-addr", addr])
             .current_dir(dir)
-            .env_remove("LIVEKIT_URL")
-            .env_remove("LIVEKIT_API_KEY")
-            .env_remove("LIVEKIT_API_SECRET")
-            .env_remove("GOOGLE_API_KEY")
-            .env_remove("CODETRIAL_WEB_ADDR")
-            .env_remove("CODETRIAL_TRUSTED_PROXY_HOPS")
-            .env_remove("NODE_ENV")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (key, value) in envs {
@@ -2619,4 +2627,198 @@ fn binary_agent_web_loads_primary_config_from_the_current_directory() {
 
     stop_child(&mut child);
     let _ = std::fs::remove_dir_all(cwd);
+}
+
+/// The launch a desktop app makes: everything in one folder it chose, and
+/// nothing read from or written to the places a CLI launch looks. The working
+/// directory here is a checkout with a config of its own, the executable's
+/// folder has one too, and the environment carries LiveKit credentials, so a
+/// launch that read any of them would be configured rather than serving Setup,
+/// and one that wrote by the CLI's rule would put the file in the checkout.
+#[test]
+fn a_data_dir_launch_reads_and_writes_only_its_data_dir() {
+    let work = temp_path("data-dir-work");
+    let home = exe_temp_path("data-dir-exe");
+    let data = temp_path("data-dir-data");
+    for dir in [&work.join("config"), &home, &data] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(
+        work.join("config").join("codetrial.env.example"),
+        "# keys\n",
+    )
+    .unwrap();
+    let checkout_config =
+        "LIVEKIT_URL=wss://checkout.example\nLIVEKIT_API_KEY=k\nLIVEKIT_API_SECRET=s\n";
+    std::fs::write(
+        work.join("config").join("codetrial.env.local"),
+        checkout_config,
+    )
+    .unwrap();
+    std::fs::write(home.join("codetrial.env.local"), checkout_config).unwrap();
+    let exe = binary_beside(&home);
+
+    let livekit_addr = spawn_livekit_room_service("key", "secret");
+    let data_arg = data.to_str().unwrap().to_string();
+    let (addr, _server) = spawn_server(|addr| {
+        let mut command = Command::new(&exe);
+        scrubbed(&mut command)
+            .args(["web", "--web-addr", addr, "--data-dir", &data_arg])
+            .current_dir(&work)
+            // Short of the three keys Setup needs, so the environment has
+            // nothing to offer this launch and must not decide anything.
+            .env("LIVEKIT_URL", "wss://environment.example")
+            .env("LIVEKIT_API_KEY", "environment-key")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    });
+
+    let page = http_request(
+        &addr,
+        &format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    let body = format!(
+        r#"{{"livekitUrl":"http://{livekit_addr}","livekitApiKey":"key","livekitApiSecret":"secret","googleApiKey":""}}"#
+    );
+    let submission = http_request(
+        &addr,
+        &format!(
+            "POST /api/setup HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+
+    let written = std::fs::read_to_string(data.join("codetrial.env.local")).unwrap_or_default();
+
+    // Made by the launch that continues after Setup, which has no
+    // `SESSION_SECRET` from the file it was just given.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !data.join("session-secret").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let secret = data.join("session-secret").exists();
+    let checkout_after =
+        std::fs::read_to_string(work.join("config").join("codetrial.env.local")).unwrap();
+    let beside_exe = home.join("config").exists();
+
+    // Stopped first: Windows will not remove the executable a live process was
+    // started from, nor the folder it keeps open.
+    drop(_server);
+    for dir in [&work, &home, &data] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    assert!(page.contains(r#"name="livekitUrl""#), "{page}");
+    assert!(submission.starts_with("HTTP/1.1 200 OK"), "{submission}");
+    assert!(
+        written.contains(&format!("LIVEKIT_URL=http://{livekit_addr}")),
+        "{written}"
+    );
+    assert!(secret, "the session key belongs in the data directory");
+    assert_eq!(checkout_after, checkout_config);
+    assert!(!beside_exe, "nothing belongs beside the executable");
+}
+
+/// A first launch from a shell that already exports what Setup asks for is not
+/// asked: the folder's config is written from those keys, owner-only, and the
+/// full app serves. Nothing else from the environment goes in, so the file is
+/// still all a later launch, started with nothing exported, needs.
+#[test]
+fn a_first_data_dir_launch_writes_the_exported_setup_keys() {
+    let home = exe_temp_path("data-dir-exported-exe");
+    let data = temp_path("data-dir-exported-data");
+    std::fs::create_dir_all(&home).unwrap();
+    let exe = binary_beside(&home);
+
+    let livekit_addr = spawn_livekit_room_service("key", "secret");
+    let livekit_url = format!("http://{livekit_addr}");
+    let data_arg = data.to_str().unwrap().to_string();
+    let (addr, server) = spawn_server(|addr| {
+        let mut command = Command::new(&exe);
+        scrubbed(&mut command)
+            .args(["web", "--web-addr", addr, "--data-dir", &data_arg])
+            .current_dir(&home)
+            .env("LIVEKIT_URL", &livekit_url)
+            .env("LIVEKIT_API_KEY", "key")
+            .env("LIVEKIT_API_SECRET", "secret")
+            .env("CODETRIAL_ROOM_PREFIX", "from-the-shell")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    });
+    let page = http_request(
+        &addr,
+        &format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    let written = std::fs::read_to_string(data.join("codetrial.env.local")).unwrap_or_default();
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(data.join("codetrial.env.local"))
+            .map(|meta| meta.permissions().mode() & 0o777)
+            .unwrap_or(0)
+    };
+    drop(server);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&data);
+
+    assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+    assert!(
+        !page.contains(r#"name="livekitUrl""#),
+        "Setup was served: {page}"
+    );
+    assert_eq!(
+        written,
+        format!("LIVEKIT_URL={livekit_url}\nLIVEKIT_API_KEY=key\nLIVEKIT_API_SECRET=secret\n")
+    );
+    #[cfg(unix)]
+    assert_eq!(mode, 0o600, "{mode:o}");
+}
+
+/// The failure note a double-clicked binary leaves beside itself goes in the
+/// data directory instead: an installed app's executable folder is read-only
+/// or inside a bundle.
+#[test]
+fn a_data_dir_launch_logs_its_failure_in_the_data_dir() {
+    let home = exe_temp_path("data-dir-log-exe");
+    let data = temp_path("data-dir-log-data");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("codetrial.env.local"),
+        "LIVEKIT_URL=wss://example.livekit.cloud\n",
+    )
+    .unwrap();
+    let exe = binary_beside(&home);
+
+    let output = scrubbed(&mut Command::new(&exe))
+        .args(["web", "--data-dir", data.to_str().unwrap()])
+        .current_dir(&home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("codetrial should exit");
+    let log = std::fs::read_to_string(data.join("codetrial-error.log")).unwrap_or_default();
+    let beside_exe = home.join("codetrial-error.log").exists();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&data);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        log.contains("missing required LiveKit credentials"),
+        "{log}"
+    );
+    assert!(!beside_exe, "the log belongs in the data directory");
+}
+
+#[test]
+fn binary_refuses_a_config_file_and_a_data_dir_together() {
+    let (code, _, stderr) = run_cli_args(&["web", "--config", "a.env", "--data-dir", "b"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("--config and --data-dir cannot be combined"),
+        "{stderr}"
+    );
 }
