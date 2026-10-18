@@ -59,9 +59,6 @@ fn only_sigkill_is_retryable() {
 /// exit status for a process that never ran, so
 /// `reject_usage_errors_with_exit_two` failed reporting 0 against 2 and read as
 /// the binary having accepted a usage error it had refused.
-///
-/// Both runners share this, so the attempt bound and what a run out of attempts
-/// says cannot drift apart between them.
 fn retry_on_sigkill<T>(args: &[&str], mut once: impl FnMut() -> Option<T>) -> T {
     for attempt in 0..5 {
         if let Some(result) = once() {
@@ -73,48 +70,22 @@ fn retry_on_sigkill<T>(args: &[&str], mut once: impl FnMut() -> Option<T>) -> T 
 }
 
 fn run_cli_args_with_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
-    retry_on_sigkill(args, || run_cli_args_with_env_once(args, envs))
+    run_cli_until_exit(args, envs)
 }
 
-fn run_cli_args_with_env_once(
-    args: &[&str],
-    envs: &[(&str, &str)],
-) -> Option<(i32, String, String)> {
-    let cwd = exe_temp_path("empty-cwd");
-    std::fs::create_dir_all(&cwd).expect("empty cwd should create");
-    let output = cli_command(args, envs, &cwd)
-        .output()
-        .expect("codetrial should exit");
-    let _ = std::fs::remove_dir_all(cwd);
-
-    let Some(code) = output.status.code() else {
-        assert!(
-            was_sigkill(&output.status),
-            "{args:?}: killed by an unexpected signal: {}",
-            output.status
-        );
-        return None;
-    };
-    Some((
-        code,
-        String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
-        String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
-    ))
-}
-
-/// The same invocation, but the process is required to stop by itself.
+/// Runs the binary and requires it to stop by itself, which every caller here
+/// expects of it.
 ///
-/// `run_cli_args` waits forever, which is right for a mode that always exits.
-/// A refusal test is not that: what it asserts is that the binary *stops*, so a
-/// regression letting it serve instead hangs the suite rather than failing it,
-/// and `cargo mutants` scores that as a timeout instead of a caught mutant.
-/// That is not hypothetical; it is how `replace == with != in run_web` reached
-/// CI as a 33-second timeout. Bounded, so a guard that stopped guarding is a
-/// red test.
+/// Bounded for every caller, not only the refusal tests: a mutant or a
+/// regression that loses the arguments falls back to `web`, which serves
+/// Setup and never exits, so any unbounded run hangs the suite rather than
+/// failing it, and `cargo mutants` scores that as a timeout instead of a
+/// caught mutant. That is how `replace == with != in run_web`, and later a
+/// `parse_agent_args` returning nothing, reached CI as timeouts.
 fn run_cli_until_exit(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
-    // Retried on a kill for the same reason the other runner is: the machine
-    // running out of memory says nothing about the binary, and this helper's
-    // whole point is that a refusal is observed rather than assumed.
+    // Retried on a kill: the machine running out of memory says nothing about
+    // the binary, and this helper's whole point is that a refusal is observed
+    // rather than assumed.
     retry_on_sigkill(args, || run_cli_until_exit_once(args, envs))
 }
 
@@ -890,6 +861,7 @@ fn binary_accepts_dash_prefixed_values_through_the_attached_form() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = occupied.local_addr().unwrap().to_string();
     write_config(&config, &dir, &address);
+
     let (code, _, stderr) = run_cli_args(&[
         "web",
         &format!("--config={}", config.to_str().unwrap()),
@@ -1630,16 +1602,11 @@ fn binary_web_refuses_to_serve_setup_on_a_public_address() {
 /// in one start, and only the second one guarded.
 #[test]
 fn binary_web_refuses_a_public_setup_address_from_the_environment() {
-    let dir = exe_temp_path("setup-public-address-env");
-    std::fs::create_dir_all(&dir).unwrap();
+    // Bounded: a launch that stopped reading the variable serves Setup on
+    // loopback instead, and must fail here rather than hang the suite.
+    let (code, _, stderr) = run_cli_until_exit(&["web"], &[("CODETRIAL_WEB_ADDR", "0.0.0.0:0")]);
 
-    let output = cli_command(&["web"], &[("CODETRIAL_WEB_ADDR", "0.0.0.0:0")], &dir)
-        .output()
-        .expect("codetrial should exit");
-    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
-    let _ = std::fs::remove_dir_all(&dir);
-
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(code, 1, "{stderr}");
     assert!(
         stderr.contains("refusing to serve the Setup page"),
         "{stderr}"
