@@ -4320,8 +4320,6 @@ fn silent_completion_kind_classifies_debt_in_precedence_order() {
     let complete = GeminiEvent::TurnComplete;
     let mut activity = RuntimeActivity::new(now);
     assert_eq!(silent_completion_kind(&complete, &activity), None);
-    activity.reply_after_thinking_discard = true;
-    assert_eq!(silent_completion_kind(&complete, &activity), None);
     activity.mark_prompted(now, None, true);
     assert_eq!(
         silent_completion_kind(&complete, &activity),
@@ -4347,6 +4345,16 @@ fn silent_completion_kind_classifies_debt_in_precedence_order() {
         None
     );
     activity.generating = true;
+    assert_eq!(silent_completion_kind(&complete, &activity), None);
+
+    // A thinking release silences every other kind, including the prompt
+    // `defer_thinking_reply` records beside it.
+    activity.generating = false;
+    activity.reply_after_thinking_discard = true;
+    assert_eq!(silent_completion_kind(&complete, &activity), None);
+    let mut activity = RuntimeActivity::new(now);
+    activity.mark_prompted(now, None, false);
+    activity.reply_after_thinking_discard = true;
     assert_eq!(silent_completion_kind(&complete, &activity), None);
 }
 

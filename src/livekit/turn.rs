@@ -973,11 +973,14 @@ impl RuntimeActivity {
 
     /// The debt a turn completed with nothing in it settles, which is what
     /// Gemini chose silence over; see `note_turn_boundary`. Required debt wins
-    /// over an optional review. A thinking release is left out: the completion
-    /// does not settle it, and `claim_thinking_reply` asks for it straight
-    /// after.
+    /// over an optional review. Nothing while a thinking release is owed: the
+    /// completion does not settle it, `claim_thinking_reply` asks for it
+    /// straight after, and the prompt `defer_thinking_reply` records beside it
+    /// would otherwise read as a required one.
     pub(super) fn debt_silence_answers(&self) -> Option<&'static str> {
-        if self.reply_in_flight() {
+        if self.reply_after_thinking_discard {
+            None
+        } else if self.reply_in_flight() {
             Some("candidate_turn")
         } else if self.owes_prompt() {
             Some("required_prompt")
