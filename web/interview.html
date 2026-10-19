@@ -726,7 +726,7 @@
            status pill, the captions and the controls. Jim is here to be looked
            at while the candidate works, so he goes where their eyes already
            are, and the stage never takes pointer events off the editor. -->
-      <aside id="jim-stage" class="jim-stage">
+      <aside id="jim-stage" class="jim-stage" tabindex="-1">
         <!-- data-avatar-state is the fallback contract: only "ready" shows
              the canvas, every other value shows the neutral panel below it.
              web/avatar/avatar.js owns the value; the CSS owns what it looks
@@ -747,6 +747,23 @@
         >
           Hide avatar
         </button>
+        <!-- On the stage, not in the sidebar: the wait for the report makes
+             the sidebar inert while Jim may still be speaking, and the stage
+             is what stays reachable over that overlay. -->
+        <div id="audio-playback-notice" class="audio-playback-notice" hidden>
+          <p>
+            Your browser blocked audio playback. Resume audio to hear the
+            interviewer.
+          </p>
+          <button id="resume-audio" class="pill-button" type="button">
+            Resume audio
+          </button>
+        </div>
+        <span
+          id="audio-playback-status"
+          class="visually-hidden"
+          role="status"
+        ></span>
         <!-- Announces only the automatic turn-off. A live region over the
              whole mount announced the canvas arriving and the preflight-time
              "unavailable", and a manual Hide already moves focus to the note. -->

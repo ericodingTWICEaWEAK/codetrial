@@ -68,6 +68,35 @@ export function interviewSource() {
   return INTERVIEW_SOURCES.map(read).join("\n");
 }
 
+/// Loads named functions out of web/interview.js against `scope`, which stands
+/// in for the module around them. Names not in `scope` fall through to the
+/// real globals, which is how `JSON` and `TextDecoder` reach them. With
+/// `stubMissing` every other name outside `scope`, globals such as `JSON`
+/// included, resolves to a stub that takes any call, property or spread, so a
+/// test names only the bindings whose effect it asserts.
+export function loadInterview(names, scope, { stubMissing = false } = {}) {
+  const source = read("web/interview.js");
+  const bodies = names.map((name) => `${functionBody(source, name)}\n}`);
+  const exports = `{ ${names.join(", ")} }`;
+  const stub = new Proxy(function () {}, {
+    get: (_, key) => (key === Symbol.iterator ? function* () {} : stub),
+    apply: () => stub,
+  });
+  // Values rather than bindings: stubbed, `x === undefined` would quietly take
+  // the wrong branch.
+  const values = new Set(["undefined", "NaN", "Infinity"]);
+  const has = (target, key) =>
+    key in target || (stubMissing && !values.has(key));
+  const get = (target, key) =>
+    key in target || !stubMissing || key === Symbol.unscopables
+      ? target[key]
+      : stub;
+  return new Function(
+    "scope",
+    `with (scope) { ${bodies.join("\n")}\n return ${exports}; }`,
+  )(new Proxy(scope, { has, get }));
+}
+
 /// The modules `interview.js` initialises, read back out of the source rather
 /// than listed a second time. A cluster split out of the page script announces
 /// itself with an `init*` export and an `init*(...)` call, so this finds the

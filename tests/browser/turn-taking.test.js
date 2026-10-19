@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { functionBody, read } from "./source.js";
+import { loadInterview, read } from "./source.js";
 import { createDrawingTurn } from "../../web/example-board.js";
 import {
   TURN_RING_LINGER_MS,
@@ -12,19 +12,6 @@ import {
   turnWindowMs,
   yieldTurnPayload,
 } from "../../web/lib.js";
-
-/// Loads named functions out of web/interview.js against `scope`, which stands
-/// in for the module around them. Names not in `scope` fall through to the
-/// real globals, which is how `JSON` and `TextDecoder` reach them.
-function loadInterview(names, scope) {
-  const source = read("web/interview.js");
-  const bodies = names.map((name) => `${functionBody(source, name)}\n}`);
-  const exports = `{ ${names.join(", ")} }`;
-  return new Function(
-    "scope",
-    `with (scope) { ${bodies.join("\n")}\n return ${exports}; }`,
-  )(new Proxy(scope, { has: (target, key) => key in target }));
-}
 
 test("a server thinking acknowledgement updates the controls and records the declared gap", () => {
   const state = { candidateThinking: false, endsAt: 12345, paused: false };

@@ -479,12 +479,16 @@ test("terminal room disconnect finalizes recovery before clearing the room", asy
   const body = source.slice(start, source.indexOf("\n  });", start));
   page.scope.reportRecovery = page.reportRecovery;
   page.scope.console = { warn() {} };
+  const playbackRooms = [];
+  page.scope.room = page.room;
+  page.scope.audioPlayback = { release: (room) => playbackRooms.push(room) };
   const disconnect = new Function(
     "scope",
     `with(scope) { return () => { ${body} }; }`,
   )(new Proxy(page.scope, { has: (target, key) => key in target }));
   disconnect();
   await settle();
+  assert.deepEqual(playbackRooms, [page.room]);
   assert.equal(page.scope.state.room, null);
   assert.equal(page.scope.state.connected, false);
   assert.equal(page.scope.state.phase, "report");

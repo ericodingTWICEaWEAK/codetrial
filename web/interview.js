@@ -1,4 +1,5 @@
 import { createReportRecovery } from "./report-recovery.js";
+import { createAudioPlayback } from "./audio-playback.js";
 import {
   createDrawingTurn,
   mountExampleBoard,
@@ -519,6 +520,9 @@ const nodes = {
   transcriptTab: document.querySelector("#transcript-tab"),
   agentState: document.querySelector("#agent-state"),
   presenceBanner: document.querySelector("#presence-banner"),
+  audioPlaybackNotice: document.querySelector("#audio-playback-notice"),
+  resumeAudio: document.querySelector("#resume-audio"),
+  audioPlaybackStatus: document.querySelector("#audio-playback-status"),
   captionsBar: document.querySelector("#captions-bar"),
   captionsText: document.querySelector("#captions-text"),
   timer: document.querySelector("#timer"),
@@ -621,6 +625,15 @@ const nodes = {
 // avatar analyser will need the same one; an anonymous appendChild left neither
 // with a handle.
 let jimAudio = null;
+// The track attached to `jimAudio`, so a reconnect can take the element off it
+// before handing the element to the new track.
+let jimTrack = null;
+const audioPlayback = createAudioPlayback({
+  notice: nodes.audioPlaybackNotice,
+  button: nodes.resumeAudio,
+  focusTarget: nodes.jimStage,
+  announcement: nodes.audioPlaybackStatus,
+});
 
 // Before `init`, because the queue's first producer is inside it. The bindings
 // are handed over rather than re-derived: one `state` object, one `nodes` map.
@@ -1670,6 +1683,7 @@ async function connectLiveKit(connection, preflight, presenting = false) {
   });
 
   const receivedReports = new Set();
+  audioPlayback.setRoom(room, livekit.RoomEvent.AudioPlaybackStatusChanged);
   room.on(
     livekit.RoomEvent.DataReceived,
     async (payload, participant, kind, topic) => {
@@ -1746,6 +1760,7 @@ async function connectLiveKit(connection, preflight, presenting = false) {
     updateAgentState();
   });
   room.on(livekit.RoomEvent.Disconnected, () => {
+    audioPlayback.release(room);
     state.connected = false;
     // Terminal, not transient: LiveKit fires Reconnecting for a recoverable
     // blip and only reaches here when it has given up. Dropping the reference
@@ -1775,10 +1790,11 @@ async function connectLiveKit(connection, preflight, presenting = false) {
     );
   }
 
-  await room.connect(connection.serverUrl, connection.token);
   try {
+    await room.connect(connection.serverUrl, connection.token);
     await publishPreflightTracks(room, preflight);
   } catch (error) {
+    audioPlayback.release(room);
     await room.disconnect().catch(() => {});
     throw error;
   }
@@ -2147,12 +2163,17 @@ function playRemoteAudio(track, participant) {
   )
     return;
   const element = jimAudio ?? document.createElement("audio");
+  // LiveKit can deliver the old track's unsubscribe after the new track's
+  // subscribe. Its detach pauses every element the track still holds, so the
+  // old track gives the element up here, before the new one starts it.
+  if (jimTrack && jimTrack !== track) jimTrack.detach?.(element);
   track.attach(element);
   element.autoplay = true;
   element.id = "jim-audio";
   jimAudio = element;
+  jimTrack = track;
   if (!element.isConnected) document.body.appendChild(element);
-  void element.play?.().catch(() => {});
+  void audioPlayback.play(element);
   // The candidate may have chosen an output before Jim's track arrived.
   void applyAudioOutput(readStored(AUDIO_OUTPUT_KEY));
   attachAvatarAnalyser(track, participant);
@@ -2165,8 +2186,9 @@ function dropRemoteAudio(track) {
   // otherwise drop the handle while the element is still playing, and
   // setSinkId would have nothing to route for the rest of the session.
   for (const element of track.detach?.() || []) {
+    audioPlayback.forget(element);
     element.remove();
-    if (element === jimAudio) jimAudio = null;
+    if (element === jimAudio) jimAudio = jimTrack = null;
   }
   // Only if it was the analyser's own track. The guard above already refuses to
   // drop Jim's element for someone else's track; without the same guard here, a
@@ -3376,6 +3398,10 @@ function renderReport() {
   // candidate was looking at a screen telling them the interview had ended.
   stopAvatar();
   stopLocalMedia();
+  // The report makes Jim's stage inert, so Resume audio could no longer be
+  // pressed. Not in stopLocalMedia: report recovery stops local media but keeps
+  // the room and the stage, where Jim's playback is still retried and tracked.
+  audioPlayback.setRoom(null);
   stopEndingClock();
   clearCandidateCases();
   nodes.ending.hidden = true;
