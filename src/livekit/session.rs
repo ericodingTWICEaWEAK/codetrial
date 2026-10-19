@@ -753,6 +753,34 @@ fn observe_latency_event(
     None
 }
 
+/// What a completion with nothing in it answered, if this event is one.
+fn silent_completion_kind(event: &GeminiEvent, activity: &RuntimeActivity) -> Option<&'static str> {
+    if matches!(event, GeminiEvent::TurnComplete) && !activity.generating {
+        activity.debt_silence_answers()
+    } else {
+        None
+    }
+}
+
+/// `accept_event_with_reply_debt`, plus the silence the event answered. Both
+/// reads come before the accept, because the accept clears the waits they
+/// read. A silent completion that settles the reply still closes the turn's
+/// timing, as model output would have.
+fn accept_event_noting_silence(
+    event: &GeminiEvent,
+    activity: &mut RuntimeActivity,
+    held: bool,
+    now: Instant,
+) -> (bool, Option<ReplyDebt>, Option<&'static str>) {
+    let silent_owed = silent_completion_kind(event, activity);
+    let silent_answer = silent_owed.is_some() && activity.owes_reply();
+    let (accepted, debt) = accept_event_with_reply_debt(event, activity, held, now);
+    if accepted && silent_answer && !activity.owes_reply() {
+        activity.turn_timing.note_model_output();
+    }
+    (accepted, debt, silent_owed.filter(|_| accepted))
+}
+
 /// Gemini said something. One arm each, because the arms share only the socket
 /// they arrived on: what a tool call has to do and what a cut-off turn has to
 /// undo have no step in common, and reading either one used to mean scrolling
@@ -797,12 +825,6 @@ pub(super) async fn handle_gemini_event(
         return Ok(());
     }
 
-    // Read before the event settles anything: a completion arriving while a
-    // reply is owed and nothing was produced is Gemini choosing silence.
-    let silent_answer = matches!(event, GeminiEvent::TurnComplete)
-        && !context.activity.generating
-        && context.activity.owes_reply();
-
     // The other silence: the generation called tools, and the candidate who
     // finished speaking still heard nothing. Left alone, Jim stays quiet until
     // the candidate speaks again.
@@ -820,15 +842,18 @@ pub(super) async fn handle_gemini_event(
     }
     let held = context.state.floor_held();
     let discarding = context.activity.discarding_output;
-    let (accepted, interruption_debt) =
-        accept_event_with_reply_debt(&event, context.activity, held, Instant::now());
+    let (accepted, interruption_debt, silent_owed) =
+        accept_event_noting_silence(&event, context.activity, held, Instant::now());
     let handled = if accepted {
-        if silent_answer && !context.activity.owes_reply() {
-            context.activity.turn_timing.note_model_output();
+        if let Some(silent_owed) = silent_owed {
             eprintln!(
-                "timing: Gemini completed a turn with no output; the owed reply is taken as a deliberate silence at={} room={}",
+                "codetrial silent_completion room={} session={} socket={} at={} owed={} cause={}",
+                room.name(),
+                context.activity.live_session_id,
+                context.activity.live_socket,
                 log_clock(context.state),
-                room.name()
+                silent_owed,
+                context.gemini.input_cause.unwrap_or("none")
             );
         }
 

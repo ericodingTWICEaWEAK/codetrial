@@ -4313,3 +4313,99 @@ async fn a_tool_acknowledgement_fits_only_with_nothing_else_to_hear() {
     );
     assert!(tool_ack_fits(&state, &output, &read, start));
 }
+
+#[test]
+fn silent_completion_kind_classifies_debt_in_precedence_order() {
+    let now = Instant::now();
+    let complete = GeminiEvent::TurnComplete;
+    let mut activity = RuntimeActivity::new(now);
+    assert_eq!(silent_completion_kind(&complete, &activity), None);
+    activity.reply_after_thinking_discard = true;
+    assert_eq!(silent_completion_kind(&complete, &activity), None);
+    activity.mark_prompted(now, None, true);
+    assert_eq!(
+        silent_completion_kind(&complete, &activity),
+        Some("optional_prompt")
+    );
+    activity.tool_response_outstanding = true;
+    assert_eq!(
+        silent_completion_kind(&complete, &activity),
+        Some("tool_continuation")
+    );
+    activity.prompt_allows_silence = false;
+    assert_eq!(
+        silent_completion_kind(&complete, &activity),
+        Some("required_prompt")
+    );
+    activity.note_candidate_finished(now, false);
+    assert_eq!(
+        silent_completion_kind(&complete, &activity),
+        Some("candidate_turn")
+    );
+    assert_eq!(
+        silent_completion_kind(&GeminiEvent::Interrupted, &activity),
+        None
+    );
+    activity.generating = true;
+    assert_eq!(silent_completion_kind(&complete, &activity), None);
+}
+
+#[test]
+fn a_silent_completion_is_classified_before_the_accept_settles_it() {
+    let now = Instant::now();
+    let complete = GeminiEvent::TurnComplete;
+
+    // (debt, what the accept leaves to classify, whether the silence settled a
+    // required reply and so closes the turn's timing)
+    for (debt, left, settled) in [
+        ("candidate_turn", None, true),
+        ("required_prompt", None, true),
+        ("optional_prompt", None, false),
+        ("tool_continuation", Some("tool_continuation"), false),
+    ] {
+        let mut activity = RuntimeActivity::new(now);
+        match debt {
+            "candidate_turn" => activity.note_candidate_finished(now, false),
+            "required_prompt" => activity.mark_prompted(now, None, false),
+            "optional_prompt" => activity.mark_prompted(now, None, true),
+            "tool_continuation" => activity.tool_response_outstanding = true,
+            _ => unreachable!(),
+        }
+        let (accepted, _, owed) = accept_event_noting_silence(&complete, &mut activity, false, now);
+        assert!(accepted, "{debt}");
+        assert_eq!(owed, Some(debt));
+        assert_eq!(silent_completion_kind(&complete, &activity), left, "{debt}");
+        assert_eq!(
+            activity
+                .turn_timing
+                .finish(now, TimingOutcome::NoAudio)
+                .is_some(),
+            settled,
+            "{debt}"
+        );
+    }
+
+    // A thinking release stays owed, so neither the log nor the timing treats
+    // the completion as its answer.
+    let mut activity = RuntimeActivity::new(now);
+    activity.reply_after_thinking_discard = true;
+    let (accepted, _, owed) = accept_event_noting_silence(&complete, &mut activity, false, now);
+    assert!(accepted);
+    assert_eq!(owed, None);
+    assert!(activity.owes_reply());
+    assert!(
+        activity
+            .turn_timing
+            .finish(now, TimingOutcome::NoAudio)
+            .is_none()
+    );
+
+    // A completion the accept swallows is no silence at all.
+    let mut activity = RuntimeActivity::new(now);
+    activity.note_candidate_finished(now, false);
+    activity.stale_turn_pending = true;
+    let (accepted, _, owed) = accept_event_noting_silence(&complete, &mut activity, false, now);
+    assert!(!accepted);
+    assert_eq!(owed, None);
+    assert!(activity.reply_in_flight());
+}

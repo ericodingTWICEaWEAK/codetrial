@@ -971,6 +971,25 @@ impl RuntimeActivity {
             || self.reply_after_thinking_discard
     }
 
+    /// The debt a turn completed with nothing in it settles, which is what
+    /// Gemini chose silence over; see `note_turn_boundary`. Required debt wins
+    /// over an optional review. A thinking release is left out: the completion
+    /// does not settle it, and `claim_thinking_reply` asks for it straight
+    /// after.
+    pub(super) fn debt_silence_answers(&self) -> Option<&'static str> {
+        if self.reply_in_flight() {
+            Some("candidate_turn")
+        } else if self.owes_prompt() {
+            Some("required_prompt")
+        } else if self.tool_response_outstanding {
+            Some("tool_continuation")
+        } else if self.prompted_at.is_some() {
+            Some("optional_prompt")
+        } else {
+            None
+        }
+    }
+
     /// Hands the floor back when a prompt has gone `PROMPT_STALL` without any
     /// output, and says what the watch tick may do about it. The reply stays
     /// owed either way: a replacement socket answers it. Not while earlier

@@ -92,8 +92,11 @@ the answer to the resume.
 
 A turn Gemini completes with no output settles what it owed. The socket has
 answered, and the model may choose silence; the idle nudges, not the watchdog,
-respond to a silence that goes on. It is logged as a deliberate silence, so a
-report of the interviewer going quiet can be told apart from a stalled socket.
+respond to a silence that goes on. The `codetrial silent_completion` line
+names in `owed` what the silence answered: the candidate's turn, a required
+or optional prompt, or a tool continuation. A report of the interviewer going
+quiet can then be told apart from a stalled socket. A reply owed after a
+thinking hold is not settled this way; it is asked for once the turn ends.
 
 `GEMINI_RESTART_LIMIT` bounds a failing endpoint rather than a long interview.
 It allows 8 opens in a row. A completed turn with output clears the run, unless
