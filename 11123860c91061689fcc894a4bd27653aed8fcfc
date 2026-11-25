@@ -1,7 +1,7 @@
 {
-  "base": "dd3679b87485cddaf78e17d70a551a002077df94",
+  "base": "96e17d4ece34b674a50ea1299e2b1cde0e1eb1d3",
   "head": "11123860c91061689fcc894a4bd27653aed8fcfc",
-  "pr_text_lines": 392,
+  "pr_text_lines": 409,
   "large_commits": [
     {
       "sha": "11123860c91061689fcc894a4bd27653aed8fcfc",
@@ -11,7 +11,10 @@
   "coverage_complete": true,
   "unmeasured_commits": [],
   "required": true,
-  "status": "pending",
+  "status": "complete",
+  "diff_hash": "0a36f4b6000ac81ff6f1f6c4ec40a588f878fcaf5170512e8036cd1add22e182",
+  "answer_digest": "b5830610fd8a6d9dc9929e7a685e48fa76f80d5c2b969a1f23e2b813d5939599",
+  "review_fingerprint": "b7022f59feaeb2cbabb7a3e4c06803e5542b4bc6bbb254b1e9b428461a6c9c3c",
   "schema_version": 1,
   "change_id": "I15947348db72414da0a24293cccf7e3b67c8d5bc",
   "workbench_started": false
